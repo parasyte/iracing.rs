@@ -9,7 +9,6 @@ use std::ffi::CStr;
 use std::fmt::{self, Display};
 use std::io::Result as IOResult;
 use std::marker::PhantomData;
-use std::mem::transmute;
 use std::os::raw::{c_char, c_void};
 use std::os::windows::raw::HANDLE;
 use std::slice::from_raw_parts;
@@ -652,10 +651,8 @@ impl Connection {
     /// Reads the data header from the shared memory map and returns a copy of the header
     /// which can be used safely elsewhere.
     fn read_header(&self) -> Header {
-        unsafe {
-            let raw_header: *const Header = transmute(self.location);
-            *raw_header
-        }
+        let raw_header = self.location as *const Header;
+        unsafe { *raw_header }
     }
 
     ///
