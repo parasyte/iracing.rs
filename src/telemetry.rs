@@ -524,13 +524,16 @@ impl<'conn> Blocking<'conn> {
         let mut event_name: Vec<u16> = DATA_EVENT_NAME.encode_utf16().collect();
         event_name.push(0);
 
-        let handle: HANDLE = unsafe { OpenEventW(SYNCHRONIZE, 0, event_name.as_ptr()) };
+        let handle = unsafe {
+            let handle: HANDLE = OpenEventW(SYNCHRONIZE, 0, event_name.as_ptr());
 
-        if handle.is_null() {
-            let errno: i32 = unsafe { GetLastError() as i32 };
+            if handle.is_null() {
+                let errno = GetLastError() as i32;
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
 
-            return Err(std::io::Error::from_raw_os_error(errno));
-        }
+            handle
+        };
 
         Ok(Blocking {
             origin: location,
@@ -565,36 +568,39 @@ impl<'conn> Blocking<'conn> {
             Err(e) => return Err(Box::new(e)),
         };
 
-        let signal = unsafe { WaitForSingleObject(self.event_handle, wait_time) };
+        unsafe {
+            let signal = WaitForSingleObject(self.event_handle, wait_time);
 
-        match signal {
-            0x80 => Err(Box::new(TelemetryError::ABANDONED)), // Abandoned
-            0x102 => Err(Box::new(TelemetryError::TIMEOUT(wait_time as usize))), // Timeout
-            0xFFFFFFFF => {
-                // Error
-                let errno = unsafe { GetLastError() as i32 };
-                Err(Box::new(std::io::Error::from_raw_os_error(errno)))
+            match signal {
+                0x80 => Err(Box::new(TelemetryError::ABANDONED)), // Abandoned
+                0x102 => Err(Box::new(TelemetryError::TIMEOUT(wait_time as usize))), // Timeout
+                0xFFFFFFFF => {
+                    // Error
+                    let errno = GetLastError() as i32;
+                    Err(Box::new(std::io::Error::from_raw_os_error(errno)))
+                }
+                0x00 => {
+                    // OK
+                    ResetEvent(self.event_handle);
+                    self.header.telemetry(self.origin)
+                }
+                _ => Err(Box::new(TelemetryError::UNKNOWN(signal as u32))),
             }
-            0x00 => {
-                // OK
-                unsafe { ResetEvent(self.event_handle) };
-                self.header.telemetry(self.origin)
-            }
-            _ => Err(Box::new(TelemetryError::UNKNOWN(signal as u32))),
         }
     }
 }
 
 impl<'conn> Drop for Blocking<'conn> {
     fn drop(&mut self) {
-        let succ = unsafe { CloseHandle(self.event_handle) };
-
-        if succ == 0 {
-            let errno: i32 = unsafe { GetLastError() as i32 };
-            panic!(
-                "Unable to close handle: {}",
-                std::io::Error::from_raw_os_error(errno)
-            );
+        unsafe {
+            let succ = CloseHandle(self.event_handle);
+            if succ == 0 {
+                let errno = GetLastError() as i32;
+                panic!(
+                    "Unable to close handle: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+            }
         }
     }
 }
@@ -623,39 +629,21 @@ impl Connection {
         let mut path: Vec<u16> = TELEMETRY_PATH.encode_utf16().collect();
         path.push(0);
 
-        let mapping: HANDLE;
-        let errno: i32;
-
         unsafe {
-            mapping = OpenFileMappingW(FILE_MAP_READ, 0, path.as_ptr());
-        };
-
-        if mapping.is_null() {
-            unsafe {
-                errno = GetLastError() as i32;
+            let mapping: HANDLE = OpenFileMappingW(FILE_MAP_READ, 0, path.as_ptr());
+            if mapping.is_null() {
+                let errno = GetLastError() as i32;
+                return Err(std::io::Error::from_raw_os_error(errno));
             }
 
-            return Err(std::io::Error::from_raw_os_error(errno));
-        }
-
-        let view: LPVOID;
-
-        unsafe {
-            view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-        }
-
-        if view.is_null() {
-            unsafe {
-                errno = GetLastError() as i32;
+            let location: LPVOID = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+            if location.is_null() {
+                let errno = GetLastError() as i32;
+                return Err(std::io::Error::from_raw_os_error(errno));
             }
 
-            return Err(std::io::Error::from_raw_os_error(errno));
+            Ok(Connection { mapping, location })
         }
-
-        Ok(Connection {
-            mapping,
-            location: view,
-        })
     }
 
     ///
@@ -663,9 +651,11 @@ impl Connection {
     ///
     /// Reads the data header from the shared memory map and returns a copy of the header
     /// which can be used safely elsewhere.
-    unsafe fn read_header(from: *const c_void) -> Header {
-        let raw_header: *const Header = transmute(from);
-        *raw_header
+    fn read_header(&self) -> Header {
+        unsafe {
+            let raw_header: *const Header = transmute(self.location);
+            *raw_header
+        }
     }
 
     ///
@@ -685,7 +675,7 @@ impl Connection {
     /// };
     /// ```
     pub fn session_info(&mut self) -> Result<SessionDetails, Box<dyn std::error::Error>> {
-        let header = unsafe { Self::read_header(self.location) };
+        let header = self.read_header();
 
         let start = (self.location as usize + header.session_info_offset as usize) as *const u8;
         let size = header.session_info_length as usize;
@@ -715,7 +705,7 @@ impl Connection {
     /// # }
     /// ```
     pub fn telemetry(&self) -> Result<Sample, Box<dyn std::error::Error>> {
-        let header = unsafe { Self::read_header(self.location) };
+        let header = self.read_header();
         header.telemetry(self.location as *const std::ffi::c_void)
     }
 
@@ -739,30 +729,30 @@ impl Connection {
     /// # }
     /// ```
     pub fn blocking(&self) -> IOResult<Blocking<'_>> {
-        Blocking::new(self.location, unsafe { Self::read_header(self.location) })
+        Blocking::new(self.location, self.read_header())
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let succ = unsafe { UnmapViewOfFile(self.location) };
-        if succ == 0 {
-            let errno: i32 = unsafe { GetLastError() as i32 };
+        unsafe {
+            let succ = UnmapViewOfFile(self.location);
+            if succ == 0 {
+                let errno = GetLastError() as i32;
+                panic!(
+                    "Unable to unmap file: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+            }
 
-            panic!(
-                "Unable to unmap file: {}",
-                std::io::Error::from_raw_os_error(errno)
-            );
-        }
-
-        let succ = unsafe { CloseHandle(self.mapping) };
-        if succ == 0 {
-            let errno: i32 = unsafe { GetLastError() as i32 };
-
-            panic!(
-                "Unable to close handle: {}",
-                std::io::Error::from_raw_os_error(errno)
-            );
+            let succ = CloseHandle(self.mapping);
+            if succ == 0 {
+                let errno = GetLastError() as i32;
+                panic!(
+                    "Unable to close handle: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+            }
         }
     }
 }
