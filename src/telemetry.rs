@@ -348,7 +348,7 @@ impl Header {
         content
     }
 
-    pub fn telemetry(&self, from_loc: *const c_void) -> Result<Sample, Box<dyn std::error::Error>> {
+    fn telemetry(&self, from_loc: *const c_void) -> Result<Sample, Box<dyn std::error::Error>> {
         let (tick, vbh) = self.latest_buffer();
         let value_buffer = self.var_buffer(vbh, from_loc);
         let value_header = self.get_var_header(from_loc);
@@ -520,7 +520,7 @@ impl Display for TelemetryError {
 impl Error for TelemetryError {}
 
 impl<'conn> Blocking<'conn> {
-    pub fn new(location: *const c_void, head: Header) -> std::io::Result<Self> {
+    fn new(location: *const c_void, head: Header) -> std::io::Result<Self> {
         let mut event_name: Vec<u16> = DATA_EVENT_NAME.encode_utf16().collect();
         event_name.push(0);
 
