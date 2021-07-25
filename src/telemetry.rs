@@ -2,17 +2,18 @@ use crate::session::*;
 use encoding_rs::mem::decode_latin1;
 use serde::{Deserialize, Serialize};
 use serde_yaml::from_str as yaml_from;
+use std::borrow::Cow;
 use std::convert::TryInto;
 use std::default::Default;
-use std::error::Error;
 use std::ffi::CStr;
-use std::fmt::{self, Display};
+use std::fmt;
 use std::io::Result as IOResult;
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_void};
 use std::os::windows::raw::HANDLE;
 use std::slice::from_raw_parts;
 use std::time::Duration;
+use thiserror::Error;
 use winapi::shared::minwindef::LPVOID;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::CloseHandle;
@@ -196,47 +197,47 @@ impl Value {
 }
 
 impl TryInto<i32> for Value {
-    type Error = &'static str;
+    type Error = ValueError;
 
     fn try_into(self) -> Result<i32, Self::Error> {
         match self {
             Self::INT(n) => Ok(n),
-            _ => Err("Value is not a signed 4-byte integer"),
+            _ => Err(ValueError::TryInto("Value is not a signed 4-byte integer")),
         }
     }
 }
 
 impl TryInto<u32> for Value {
-    type Error = &'static str;
+    type Error = ValueError;
 
     fn try_into(self) -> Result<u32, Self::Error> {
         match self {
             Self::INT(n) => Ok(n as u32),
             Self::BITS(n) => Ok(n),
-            _ => Err("Value is not a 4-byte integer"),
+            _ => Err(ValueError::TryInto("Value is not a 4-byte integer")),
         }
     }
 }
 
 impl TryInto<f32> for Value {
-    type Error = &'static str;
+    type Error = ValueError;
 
     fn try_into(self) -> Result<f32, Self::Error> {
         match self {
             Self::FLOAT(n) => Ok(n),
-            _ => Err("Value is not a float"),
+            _ => Err(ValueError::TryInto("Value is not a float")),
         }
     }
 }
 
 impl TryInto<f64> for Value {
-    type Error = &'static str;
+    type Error = ValueError;
 
     fn try_into(self) -> Result<f64, Self::Error> {
         match self {
             Self::DOUBLE(n) => Ok(n),
             Self::FLOAT(f) => Ok(f as f64),
-            _ => Err("Value is not a float or double"),
+            _ => Err(ValueError::TryInto("Value is not a float or double")),
         }
     }
 }
@@ -303,7 +304,7 @@ impl Default for ValueHeader {
 }
 
 impl fmt::Debug for ValueHeader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "ValueHeader(name=\"{}\", type={}, count={}, offset={})",
@@ -351,16 +352,12 @@ impl Header {
         content
     }
 
-    fn telemetry(&self, from_loc: *const c_void) -> Result<Sample, Box<dyn std::error::Error>> {
+    fn telemetry(&self, from_loc: *const c_void) -> Sample {
         let (tick, vbh) = self.latest_buffer();
         let value_buffer = self.var_buffer(vbh, from_loc);
         let value_header = self.get_var_header(from_loc);
 
-        Ok(Sample::new(
-            tick,
-            value_header.to_vec(),
-            value_buffer.to_vec(),
-        ))
+        Sample::new(tick, value_header.to_vec(), value_buffer.to_vec())
     }
 }
 
@@ -425,9 +422,9 @@ impl Sample {
     ///
     /// `name`  Name of the telemetry variable to get
     ///   - see the iRacing Telemtry documentation for a complete list of possible values
-    pub fn get(&self, name: &'static str) -> Result<Value, String> {
+    pub fn get(&self, name: &'static str) -> Result<Value, SampleError> {
         match self.header_for(name) {
-            None => Err(format!("No value '{}' found", name)),
+            None => Err(SampleError::NoValue(format!("No value '{}' found", name))),
             Some(vh) => Ok(self.value(&vh)),
         }
     }
@@ -499,31 +496,51 @@ impl Sample {
     }
 }
 
-///
-/// Telemetry Error
-///
 /// An error which occurs when telemetry samples cannot be read from the memory buffer.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TelemetryError {
-    ABANDONED,
-    TIMEOUT(usize),
-    UNKNOWN(u32),
+    #[error("Invalid duration: {0}")]
+    InvalidDuration(#[from] std::num::TryFromIntError),
+
+    #[error("Windows Mutex was abandoned.")]
+    Abandoned,
+
+    #[error("Timeout elapsed while waiting for a signal. Duration={0}")]
+    Timeout(usize),
+
+    #[error("Unknown error occurred: {0}")]
+    Unknown(u32),
+
+    #[error("Wait failed: {0}")]
+    WaitFailed(std::io::Error),
 }
 
-impl Display for TelemetryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ABANDONED => write!(f, "Abandoned"),
-            Self::TIMEOUT(ms) => write!(f, "Timeout after {}ms", ms),
-            Self::UNKNOWN(v) => write!(f, "Unknown error code = {:x?}", v),
-        }
-    }
+/// An error which occurs while retrieving session info.
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error("Text decode error: {0}")]
+    Decode(Cow<'static, str>),
+
+    #[error("YAML parse error: {0}")]
+    ParseYAML(#[from] serde_yaml::Error),
 }
 
-impl Error for TelemetryError {}
+/// An error which occurs when value conversions fail.
+#[derive(Debug, Error)]
+pub enum ValueError {
+    #[error("{0}")]
+    TryInto(&'static str),
+}
+
+/// An error which may occur when reading values from a sample.
+#[derive(Debug, Error)]
+pub enum SampleError {
+    #[error("{0}")]
+    NoValue(String),
+}
 
 impl<'conn> Blocking<'conn> {
-    fn new(location: *const c_void) -> std::io::Result<Self> {
+    fn new(location: *const c_void) -> IOResult<Self> {
         let mut event_name: Vec<u16> = DATA_EVENT_NAME.encode_utf16().collect();
         event_name.push(0);
 
@@ -575,29 +592,26 @@ impl<'conn> Blocking<'conn> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn sample(&self, timeout: Duration) -> Result<Sample, Box<dyn Error>> {
-        let wait_time: u32 = match timeout.as_millis().try_into() {
-            Ok(v) => v,
-            Err(e) => return Err(Box::new(e)),
-        };
+    pub fn sample(&self, timeout: Duration) -> Result<Sample, TelemetryError> {
+        let wait_time: u32 = timeout.as_millis().try_into()?;
 
         unsafe {
             let signal = WaitForSingleObject(self.event_handle, wait_time);
 
             match signal {
-                0x80 => Err(Box::new(TelemetryError::ABANDONED)), // Abandoned
-                0x102 => Err(Box::new(TelemetryError::TIMEOUT(wait_time as usize))), // Timeout
+                0x80 => Err(TelemetryError::Abandoned),
+                0x102 => Err(TelemetryError::Timeout(wait_time as usize)),
                 0xFFFFFFFF => {
                     // Error
-                    let errno = GetLastError() as i32;
-                    Err(Box::new(std::io::Error::from_raw_os_error(errno)))
+                    let errno = std::io::Error::from_raw_os_error(GetLastError() as i32);
+                    Err(TelemetryError::WaitFailed(errno))
                 }
                 0x00 => {
                     // OK
                     ResetEvent(self.event_handle);
-                    self.read_header().telemetry(self.origin)
+                    Ok(self.read_header().telemetry(self.origin))
                 }
-                _ => Err(Box::new(TelemetryError::UNKNOWN(signal as u32))),
+                _ => Err(TelemetryError::Unknown(signal as u32)),
             }
         }
     }
@@ -688,7 +702,7 @@ impl Connection {
     ///     Err(e) => println!("Invalid Session")
     /// };
     /// ```
-    pub fn session_info(&self) -> Result<SessionDetails, Box<dyn std::error::Error>> {
+    pub fn session_info(&self) -> Result<SessionDetails, SessionError> {
         let header = self.read_header();
 
         let start = (self.location as usize + header.session_info_offset as usize) as *const u8;
@@ -711,14 +725,14 @@ impl Connection {
     /// # Examples
     ///
     /// ```
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), std::io::Error> {
     /// use iracing::telemetry::Connection;
     ///
-    /// let sample = Connection::new()?.telemetry()?;
+    /// let sample = Connection::new()?.telemetry();
     /// # Ok(())
     /// # }
     /// ```
-    pub fn telemetry(&self) -> Result<Sample, Box<dyn std::error::Error>> {
+    pub fn telemetry(&self) -> Sample {
         let header = self.read_header();
         header.telemetry(self.location as *const std::ffi::c_void)
     }
@@ -788,12 +802,6 @@ mod tests {
     fn test_latest_telemetry() {
         let session_tick: u32 = Connection::new()
             .expect("Unable to open telemetry")
-            .telemetry()
-            .expect("Couldn't get latest telem")
-            .get("SessionTick")
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert!(session_tick > 0);
+            .telemetry();
     }
 }
