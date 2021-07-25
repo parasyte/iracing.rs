@@ -674,7 +674,7 @@ impl Connection {
     ///     Err(e) => println!("Invalid Session")
     /// };
     /// ```
-    pub fn session_info(&mut self) -> Result<SessionDetails, Box<dyn std::error::Error>> {
+    pub fn session_info(&self) -> Result<SessionDetails, Box<dyn std::error::Error>> {
         let header = self.read_header();
 
         let start = (self.location as usize + header.session_info_offset as usize) as *const u8;
