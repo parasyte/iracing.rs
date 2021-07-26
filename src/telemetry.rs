@@ -638,6 +638,7 @@ impl Connection {
             let location: LPVOID = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
             if location.is_null() {
                 let errno = GetLastError() as i32;
+                CloseHandle(mapping); // Ignore return value; we are already handling another error.
                 return Err(std::io::Error::from_raw_os_error(errno));
             }
 
@@ -736,6 +737,7 @@ impl Drop for Connection {
             let succ = UnmapViewOfFile(self.location);
             if succ == 0 {
                 let errno = GetLastError() as i32;
+                CloseHandle(self.mapping); // Ignore return value; we are already handling another error.
                 panic!(
                     "Unable to unmap file: {}",
                     std::io::Error::from_raw_os_error(errno)
