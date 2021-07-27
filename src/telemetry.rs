@@ -57,7 +57,6 @@ pub struct Header {
 ///
 pub struct Blocking<'conn> {
     origin: *const c_void,
-    header: Header,
     event_handle: HANDLE,
     phantom: PhantomData<&'conn Connection>,
 }
@@ -318,10 +317,15 @@ impl fmt::Debug for ValueHeader {
 
 impl Header {
     fn latest_buffer(&self) -> (i32, ValueBuffer) {
-        let mut latest_tick: i32 = 0;
         let mut buffer = self.buffers[0];
+        let mut latest_tick = buffer.ticks;
 
-        for b in self.buffers.iter() {
+        for b in self
+            .buffers
+            .iter()
+            .skip(1)
+            .take((self.n_buffers - 1) as usize)
+        {
             if b.ticks > latest_tick {
                 buffer = *b;
                 latest_tick = b.ticks;
@@ -519,7 +523,7 @@ impl Display for TelemetryError {
 impl Error for TelemetryError {}
 
 impl<'conn> Blocking<'conn> {
-    fn new(location: *const c_void, head: Header) -> std::io::Result<Self> {
+    fn new(location: *const c_void) -> std::io::Result<Self> {
         let mut event_name: Vec<u16> = DATA_EVENT_NAME.encode_utf16().collect();
         event_name.push(0);
 
@@ -536,10 +540,20 @@ impl<'conn> Blocking<'conn> {
 
         Ok(Blocking {
             origin: location,
-            header: head,
             event_handle: handle,
             phantom: PhantomData,
         })
+    }
+
+    /// Get the data header
+    ///
+    /// Reads the data header from the shared memory map and returns a copy of the header
+    /// which can be used safely elsewhere.
+    fn read_header(&self) -> Header {
+        let raw_header = self.origin as *const Header;
+        // SAFETY: This read CANNOT be done safely, since it is an unsynchronized clone of a struct
+        // larger than AtomicUsize.
+        unsafe { *raw_header }
     }
 
     ///
@@ -581,7 +595,7 @@ impl<'conn> Blocking<'conn> {
                 0x00 => {
                     // OK
                     ResetEvent(self.event_handle);
-                    self.header.telemetry(self.origin)
+                    self.read_header().telemetry(self.origin)
                 }
                 _ => Err(Box::new(TelemetryError::UNKNOWN(signal as u32))),
             }
@@ -653,6 +667,8 @@ impl Connection {
     /// which can be used safely elsewhere.
     fn read_header(&self) -> Header {
         let raw_header = self.location as *const Header;
+        // SAFETY: This read CANNOT be done safely, since it is an unsynchronized clone of a struct
+        // larger than AtomicUsize.
         unsafe { *raw_header }
     }
 
@@ -727,7 +743,7 @@ impl Connection {
     /// # }
     /// ```
     pub fn blocking(&self) -> IOResult<Blocking<'_>> {
-        Blocking::new(self.location, self.read_header())
+        Blocking::new(self.location)
     }
 }
 
